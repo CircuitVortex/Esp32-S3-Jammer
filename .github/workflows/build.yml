@@ -1,1 +1,205 @@
+name: Build deauth.ino (ESP32-S3 N16R8 — Headless CDC)
 
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Arduino CLI
+        uses: arduino/setup-arduino-cli@v2
+
+      - name: Cache toolchain
+        uses: actions/cache@v4
+        with:
+          path: ~/.arduino15/packages/esp32
+          key: esp32-3.3.11-${{ hashFiles('build.yml') }}
+
+      - name: Install ESP32 core 3.3.11
+        run: |
+          set -euo pipefail
+          arduino-cli config init --overwrite
+          arduino-cli config set board_manager.additional_urls \
+            https://espressif.github.io/arduino-esp32/package_esp32_index.json
+          arduino-cli core update-index
+          arduino-cli core install esp32:esp32@3.3.11
+          arduino-cli core list | grep -q "esp32:esp32.*3.3.11" || {
+            echo "FATAL: core 3.3.11 not installed"; exit 1;
+          }
+
+      - name: Locate toolchain tools
+        run: |
+          set -euo pipefail
+          TOOLS="$HOME/.arduino15/packages/esp32/tools"
+          PKG="$HOME/.arduino15/packages/esp32"
+
+          OBJCOPY=$(find "$TOOLS" -name "xtensa-esp32s3-elf-objcopy" -type f | sort -V | tail -1)
+          NM=$(find "$TOOLS" -name "xtensa-esp32s3-elf-nm"      -type f | sort -V | tail -1)
+          READELF=$(find "$TOOLS" -name "xtensa-esp32s3-elf-readelf" -type f | sort -V | tail -1)
+          AR=$(find "$TOOLS" -name "xtensa-esp32s3-elf-ar"      -type f | sort -V | tail -1)
+          OBJDUMP=$(find "$TOOLS" -name "xtensa-esp32s3-elf-objdump" -type f | sort -V | tail -1)
+
+          LIBNET=$(find "$PKG" -name "libnet80211.a" -type f 2>/dev/null | \
+            grep -i esp32s3 | sort -V | tail -1 || true)
+          if [ -z "$LIBNET" ]; then
+            LIBNET=$(find "$PKG" -name "libnet80211.a" -type f 2>/dev/null | \
+              sort -V | tail -1 || true)
+          fi
+
+          [ -x "$OBJCOPY" ] || { echo "FATAL: objcopy missing"; exit 1; }
+          [ -x "$NM"      ] || { echo "FATAL: nm missing"; exit 1; }
+          [ -x "$READELF" ] || { echo "FATAL: readelf missing"; exit 1; }
+          [ -x "$AR"      ] || { echo "FATAL: ar missing"; exit 1; }
+          [ -x "$OBJDUMP" ] || { echo "FATAL: objdump missing"; exit 1; }
+          [ -f "$LIBNET"  ] || {
+            echo "FATAL: libnet80211.a not found"
+            find "$PKG" -name "libnet80211.a" 2>/dev/null || true
+            exit 1
+          }
+
+          {
+            echo "OBJCOPY=$OBJCOPY"
+            echo "NM=$NM"
+            echo "READELF=$READELF"
+            echo "AR=$AR"
+            echo "OBJDUMP=$OBJDUMP"
+            echo "LIBNET=$LIBNET"
+          } >> "$GITHUB_ENV"
+
+          echo "OBJCOPY : $OBJCOPY"
+          echo "NM      : $NM"
+          echo "READELF : $READELF"
+          echo "AR      : $AR"
+          echo "OBJDUMP : $OBJDUMP"
+          echo "LIBNET  : $LIBNET"
+
+      - name: Patch libnet80211.a — extract, weaken symbol in member, re-archive
+        run: |
+          set -euo pipefail
+
+          echo "=== BEFORE (archive) ==="
+          "$NM" "$LIBNET" 2>/dev/null | grep "ieee80211_raw_frame_sanity_check" || true
+
+          TMP=$(mktemp -d)
+          trap 'rm -rf "$TMP"' EXIT
+          cd "$TMP"
+
+          # Extract every member
+          "$AR" x "$LIBNET"
+
+          # Find which .o owns the symbol
+          TARGET_O=""
+          for o in *.o; do
+            if "$NM" "$o" 2>/dev/null | grep -q "ieee80211_raw_frame_sanity_check"; then
+              echo "Found symbol in: $o"
+              TARGET_O="$o"
+              "$NM" "$o" | grep "ieee80211_raw_frame_sanity_check"
+            fi
+          done
+
+          if [ -z "$TARGET_O" ]; then
+            echo "WARN: symbol not present in any member — nothing to weaken"
+          else
+            # Weaken the symbol inside the object file itself
+            "$OBJCOPY" --weaken-symbol=ieee80211_raw_frame_sanity_check "$TARGET_O" "${TARGET_O}.weak"
+            mv "${TARGET_O}.weak" "$TARGET_O"
+
+            echo "=== AFTER (member $TARGET_O) ==="
+            "$NM" "$TARGET_O" | grep "ieee80211_raw_frame_sanity_check" || true
+
+            # Must be weak now
+            if "$NM" "$TARGET_O" | grep -qE " [Tt] ieee80211_raw_frame_sanity_check"; then
+              echo "FATAL: symbol still strong TEXT after objcopy --weaken"
+              exit 1
+            fi
+            if ! "$NM" "$TARGET_O" | grep -qE " [Ww] ieee80211_raw_frame_sanity_check"; then
+              echo "FATAL: symbol not weak after objcopy"
+              exit 1
+            fi
+            echo "Member weaken OK"
+          fi
+
+          # Rebuild the archive from the (possibly patched) members
+          rm -f "$LIBNET"
+          "$AR" rcs "$LIBNET" *.o
+
+          echo "=== AFTER (archive) ==="
+          AFTER=$("$NM" "$LIBNET" 2>/dev/null | grep "ieee80211_raw_frame_sanity_check" || true)
+          echo "$AFTER"
+
+          if echo "$AFTER" | grep -qE " [Tt] "; then
+            echo "FATAL: archive still has strong TEXT symbol"
+            exit 1
+          fi
+          if [ -n "$AFTER" ] && ! echo "$AFTER" | grep -qE " [Ww] "; then
+            echo "FATAL: archive symbol not weak"
+            exit 1
+          fi
+
+          "$AR" t "$LIBNET" >/dev/null || { echo "FATAL: archive corrupted"; exit 1; }
+          echo "Archive integrity OK — symbol is weak (or absent)"
+
+      - name: Compile
+        run: |
+          set -euo pipefail
+          mkdir -p deauth
+          cp deauth.ino deauth/
+
+          FQBN="esp32:esp32:esp32s3:\
+          PartitionScheme=huge_app,\
+          CDCOnBoot=cdc,\
+          USBMode=hwcdc,\
+          PSRAM=opi,\
+          FlashMode=qio,\
+          FlashSize=16M,\
+          CPUFreq=240,\
+          DebugLevel=none,\
+          UploadSpeed=921600"
+
+          FQBN=$(echo "$FQBN" | tr -d ' \n')
+          echo "FQBN: $FQBN"
+
+          arduino-cli compile --fqbn "$FQBN" --output-dir build deauth
+          ls -lh build/
+
+      - name: Verify symbol resolution
+        run: |
+          set -euo pipefail
+          ELF=$(find build -name "*.elf" | sort | head -1)
+          [ -f "$ELF" ] || { echo "FATAL: ELF not found"; exit 1; }
+          echo "ELF: $ELF"
+
+          SYM=$("$NM" "$ELF" | grep -w "ieee80211_raw_frame_sanity_check" || true)
+          echo "Symbol in ELF: $SYM"
+          [ -n "$SYM" ] || { echo "FATAL: symbol absent from ELF"; exit 1; }
+
+          if echo "$SYM" | grep -qE " [Uu] "; then
+            echo "FATAL: symbol is undefined — strong override did not link"
+            exit 1
+          fi
+          if ! echo "$SYM" | grep -qE " [Tt] "; then
+            echo "FATAL: unexpected binding (expected T/t): $SYM"
+            exit 1
+          fi
+          echo "PASS: symbol is T (strong, defined) in final ELF"
+
+          echo "=== Disassembly of override (proof it is our return-0 stub) ==="
+          "$OBJDUMP" -d "$ELF" 2>/dev/null | \
+            awk '/<ieee80211_raw_frame_sanity_check>:/,/^$/' | head -20 || true
+
+          echo "=== Library symbol state (should be weak W) ==="
+          "$NM" "$LIBNET" 2>/dev/null | grep "ieee80211_raw_frame_sanity_check" || true
+
+          echo "Verification complete."
+
+      - name: Upload firmware artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: deauth-n16r8-headless-cdc
+          path: build/
+          retention-days: 30
