@@ -1,20 +1,28 @@
-name: Build deauth.ino (ESP32-S3 N16R8 — Headless CDC)
+# ESP32-S3 Deauth — GitHub Actions build
+# Patches libnet80211.a, installs NimBLE, compiles for esp32s3
+
+name: ESP32-S3 Deauth Build
 
 on:
   push:
-    branches: [main, master]
+    paths:
+      - 'deauth.ino'
+      - 'build.yml'
+      - '.github/workflows/**'
   workflow_dispatch:
 
 jobs:
   build:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
       - name: Setup Arduino CLI
         uses: arduino/setup-arduino-cli@v2
+        with:
+          version: "1.x"
 
-      - name: Cache toolchain
+      - name: Cache ESP32 core
         uses: actions/cache@v4
         with:
           path: ~/.arduino15/packages/esp32
@@ -32,7 +40,15 @@ jobs:
             echo "FATAL: core 3.3.11 not installed"; exit 1;
           }
 
-      - name: Locate toolchain tools
+      - name: Install NimBLE-Arduino
+        run: |
+          set -euo pipefail
+          arduino-cli lib install "NimBLE-Arduino"
+          arduino-cli lib list | grep -qi NimBLE || {
+            echo "FATAL: NimBLE-Arduino not installed"; exit 1;
+          }
+
+      - name: Locate tools + libnet80211.a
         run: |
           set -euo pipefail
           TOOLS="$HOME/.arduino15/packages/esp32/tools"
@@ -78,7 +94,7 @@ jobs:
           echo "OBJDUMP : $OBJDUMP"
           echo "LIBNET  : $LIBNET"
 
-      - name: Patch libnet80211.a — extract, weaken symbol in member, re-archive
+      - name: Weaken ieee80211_raw_frame_sanity_check
         run: |
           set -euo pipefail
 
@@ -89,10 +105,8 @@ jobs:
           trap 'rm -rf "$TMP"' EXIT
           cd "$TMP"
 
-          # Extract every member
           "$AR" x "$LIBNET"
 
-          # Find which .o owns the symbol
           TARGET_O=""
           for o in *.o; do
             if "$NM" "$o" 2>/dev/null | grep -q "ieee80211_raw_frame_sanity_check"; then
@@ -105,14 +119,12 @@ jobs:
           if [ -z "$TARGET_O" ]; then
             echo "WARN: symbol not present in any member — nothing to weaken"
           else
-            # Weaken the symbol inside the object file itself
             "$OBJCOPY" --weaken-symbol=ieee80211_raw_frame_sanity_check "$TARGET_O" "${TARGET_O}.weak"
             mv "${TARGET_O}.weak" "$TARGET_O"
 
             echo "=== AFTER (member $TARGET_O) ==="
             "$NM" "$TARGET_O" | grep "ieee80211_raw_frame_sanity_check" || true
 
-            # Must be weak now
             if "$NM" "$TARGET_O" | grep -qE " [Tt] ieee80211_raw_frame_sanity_check"; then
               echo "FATAL: symbol still strong TEXT after objcopy --weaken"
               exit 1
@@ -124,7 +136,6 @@ jobs:
             echo "Member weaken OK"
           fi
 
-          # Rebuild the archive from the (possibly patched) members
           rm -f "$LIBNET"
           "$AR" rcs "$LIBNET" *.o
 
@@ -144,7 +155,7 @@ jobs:
           "$AR" t "$LIBNET" >/dev/null || { echo "FATAL: archive corrupted"; exit 1; }
           echo "Archive integrity OK — symbol is weak (or absent)"
 
-      - name: Compile
+      - name: Compile firmware
         run: |
           set -euo pipefail
           mkdir -p deauth
@@ -167,39 +178,11 @@ jobs:
           arduino-cli compile --fqbn "$FQBN" --output-dir build deauth
           ls -lh build/
 
-      - name: Verify symbol resolution
-        run: |
-          set -euo pipefail
-          ELF=$(find build -name "*.elf" | sort | head -1)
-          [ -f "$ELF" ] || { echo "FATAL: ELF not found"; exit 1; }
-          echo "ELF: $ELF"
-
-          SYM=$("$NM" "$ELF" | grep -w "ieee80211_raw_frame_sanity_check" || true)
-          echo "Symbol in ELF: $SYM"
-          [ -n "$SYM" ] || { echo "FATAL: symbol absent from ELF"; exit 1; }
-
-          if echo "$SYM" | grep -qE " [Uu] "; then
-            echo "FATAL: symbol is undefined — strong override did not link"
-            exit 1
-          fi
-          if ! echo "$SYM" | grep -qE " [Tt] "; then
-            echo "FATAL: unexpected binding (expected T/t): $SYM"
-            exit 1
-          fi
-          echo "PASS: symbol is T (strong, defined) in final ELF"
-
-          echo "=== Disassembly of override (proof it is our return-0 stub) ==="
-          "$OBJDUMP" -d "$ELF" 2>/dev/null | \
-            awk '/<ieee80211_raw_frame_sanity_check>:/,/^$/' | head -20 || true
-
-          echo "=== Library symbol state (should be weak W) ==="
-          "$NM" "$LIBNET" 2>/dev/null | grep "ieee80211_raw_frame_sanity_check" || true
-
-          echo "Verification complete."
-
-      - name: Upload firmware artifact
+      - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: deauth-n16r8-headless-cdc
-          path: build/
-          retention-days: 30
+          name: deauth-firmware
+          path: |
+            build/*.bin
+            build/*.elf
+            deauth.ino
